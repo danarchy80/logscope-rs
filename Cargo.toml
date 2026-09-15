@@ -7,11 +7,18 @@ description = "Rust port of the LogScope log-parsing core (Phase 1: models + par
 [dependencies]
 bzip2 = "0.6.1"
 chrono = "0.4"
+clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.10"
 regex = "1"
 tar = "0.4.46"
 thiserror = "2.0.20"
 zip = "8.6.0"
 
+[[bin]]
+name = "logscope-cli"
+path = "src/bin/logscope_cli.rs"
+
 [dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
 tempfile = "3.27.0"
