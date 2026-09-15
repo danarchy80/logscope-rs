@@ -11,7 +11,6 @@ flate2 = "1.1.10"
 regex = "1"
 tar = "0.4.46"
 thiserror = "2.0.20"
-walkdir = "2.5.0"
 zip = "8.6.0"
 
 [dev-dependencies]
