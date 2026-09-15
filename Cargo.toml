@@ -1,0 +1,9 @@
+[package]
+name = "logscope"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the LogScope log-parsing core (Phase 1: models + parser)"
+
+[dependencies]
+chrono = "0.4"
+regex = "1"
