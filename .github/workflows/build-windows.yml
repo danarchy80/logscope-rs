@@ -20,15 +20,6 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-
       - name: Test
         run: cargo test --release
 
