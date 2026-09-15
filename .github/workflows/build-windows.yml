@@ -27,13 +27,13 @@ jobs:
         run: cargo test --release
 
       - name: Build EXE
-        run: cargo build --release --bin logscope-cli
+        run: cargo build --release --bin logscope-gui
 
       - name: Rename artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/logscope-cli.exe dist/LogScope.exe -Force
+          Copy-Item target/release/logscope-gui.exe dist/LogScope.exe -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
