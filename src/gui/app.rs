@@ -228,7 +228,7 @@ impl LogScopeApp {
             }
         });
         ui.horizontal(|ui| {
-            let export_btn = ui.add_enabled(!self.running, egui::Button::new("Export"));
+            let export_btn = crate::gui::theme::hero_button(ui, "Export", !self.running);
             if export_btn.clicked() {
                 self.start_export();
             }

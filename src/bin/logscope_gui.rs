@@ -30,6 +30,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "LogScope — Unified Log Exporter",
         options,
-        Box::new(|_cc| Ok(Box::new(LogScopeApp::default()))),
+        Box::new(|cc| {
+            logscope::gui::theme::install(&cc.egui_ctx);
+            Ok(Box::new(LogScopeApp::default()))
+        }),
     )
 }
