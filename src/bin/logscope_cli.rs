@@ -8,7 +8,8 @@ use std::process::exit;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 
-use logscope::core::pipeline::run_pipeline;
+use logscope::core::pipeline::{run_pipeline_with_options, run_heatmap, PipelineOptions};
+use logscope::models::Level;
 use logscope::datetime::parse_datetime;
 
 /// Far-past default lower bound (inclusive): 1970-01-01T00:00:00Z.
@@ -25,13 +26,13 @@ fn default_end() -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-/// LogScope: ingest logs, filter by time range, export a unified log.
+/// LogScope: ingest logs, filter by time range and search, export a unified log.
 #[derive(Parser, Debug)]
-#[command(name = "logscope-cli", about = "Filter and unify log files by time range")]
+#[command(name = "logscope-cli", about = "Filter and unify log files by time range and search")]
 struct Cli {
     /// Input path: file, directory, .zip, or .tar/.tar.gz/.tgz/.tar.bz2/.tbz2
-    #[arg(short = 'i', long = "input")]
-    input: PathBuf,
+    #[arg(short = 'i', long = "input", required = true)]
+    input: Vec<PathBuf>,
 
     /// Inclusive start of the time range (RFC 3339 or "YYYY-MM-DD HH:MM:SS")
     #[arg(short = 's', long = "start")]
@@ -44,6 +45,26 @@ struct Cli {
     /// Output file path
     #[arg(short = 'o', long = "output", default_value = "unified.log")]
     output: PathBuf,
+
+    /// Filter by severity levels (comma-separated, e.g., "error,warn")
+    #[arg(long = "level")]
+    level: Vec<String>,
+
+    /// Filter by source substring
+    #[arg(long = "source")]
+    source: Vec<String>,
+
+    /// Filter by search substring
+    #[arg(long = "search")]
+    search: Option<String>,
+
+    /// Output heatmap SVG path
+    #[arg(long = "heatmap")]
+    heatmap: Option<PathBuf>,
+
+    /// Number of heatmap buckets
+    #[arg(long = "buckets", default_value_t = 60)]
+    buckets: usize,
 }
 
 fn main() {
@@ -70,8 +91,41 @@ fn main() {
         eprintln!("error: --end ({end}) is before --start ({start})");
         exit(2);
     }
+    
+    let levels = if cli.level.is_empty() {
+        None
+    } else {
+        let mut parsed_levels = Vec::new();
+        for t in cli.level.iter().flat_map(|s| s.split(',')) {
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(lvl) = Level::parse(t) {
+                parsed_levels.push(lvl);
+            } else {
+                eprintln!("error: --level: unknown level {t}");
+                exit(2);
+            }
+        }
+        if parsed_levels.is_empty() { None } else { Some(parsed_levels) }
+    };
+    
+    let sources = if cli.source.is_empty() {
+        None
+    } else {
+        Some(cli.source.clone())
+    };
 
-    match run_pipeline(&cli.input, start, end, &cli.output) {
+    let opts = PipelineOptions {
+        start,
+        end,
+        levels,
+        sources: sources.clone(),
+        search: cli.search,
+    };
+
+    match run_pipeline_with_options(&cli.input, &opts, &cli.output) {
         Ok(res) => {
             println!(
                 "Exported {} of {} entries from {} source(s) to {}",
@@ -80,11 +134,22 @@ fn main() {
                 res.sources,
                 cli.output.display()
             );
-            exit(0);
         }
         Err(e) => {
             eprintln!("error: {e}");
             exit(1);
         }
     }
+
+    if let Some(path) = cli.heatmap {
+        match run_heatmap(&cli.input, start, end, sources, cli.buckets, &path) {
+            Ok(_) => println!("Heatmap written to {}", path.display()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                exit(1);
+            }
+        }
+    }
+    
+    exit(0);
 }

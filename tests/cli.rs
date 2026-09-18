@@ -122,3 +122,46 @@ fn cli_output_file_written() {
     assert!(out.exists());
     assert!(!fs::read_to_string(&out).unwrap().is_empty());
 }
+
+#[test]
+fn cli_search() {
+    let tmp = TempDir::new().unwrap();
+    let simple = write_simple(&tmp);
+    let out = tmp.path().join("out.log");
+    cli()
+        .args([
+            "--input",
+            simple.to_str().unwrap(),
+            "--search",
+            "timeout",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Exported 1 of 6 entries"));
+}
+
+#[test]
+fn cli_heatmap() {
+    let tmp = TempDir::new().unwrap();
+    let simple = write_simple(&tmp);
+    let out = tmp.path().join("out.log");
+    let svg = tmp.path().join("out.svg");
+    cli()
+        .args([
+            "--input",
+            simple.to_str().unwrap(),
+            "--heatmap",
+            svg.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Heatmap written to"));
+    
+    assert!(svg.exists());
+    let content = fs::read_to_string(&svg).unwrap();
+    assert!(content.starts_with("<svg"));
+}

@@ -29,7 +29,9 @@ pub static TIMESTAMP_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             .unwrap(),
         // 4. Apache common log format
         Regex::new(r"(\d{1,2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{2}:?\d{2})").unwrap(),
-        // 5. Syslog (no year)
+        // 5. Syslog with RFC 3164 <PRI> prefix, e.g. "<34>Aug 26 10:00:00"
+        Regex::new(r"(<\d+>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})").unwrap(),
+        // 6. Syslog (no year, no PRI)
         Regex::new(r"(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})").unwrap(),
     ]
 });
@@ -109,16 +111,30 @@ fn parse_timestamp_string(ts_str: &str) -> Option<DateTime<Utc>> {
     if let Some(dt) = try_formats(ts_str) {
         return Some(dt);
     }
+    // RFC 3164 syslog may carry a leading `<PRI>` prefix (e.g. "<34>Aug 26
+    // 10:00:00"). Strip it before the syslog no-year fallback parse.
+    let syslog_ts = strip_pri(ts_str);
     // Syslog (e.g. "Aug 26 10:00:00") has no year; assume the current year.
     // chrono's NaiveDateTime::parse_from_str REQUIRES a year (Python's strptime
     // silently defaults it to 1900, then .replace(year=now.year)). So prepend
     // the current year before parsing, then convert to UTC.
     let year = Local::now().year();
-    let full = format!("{year} {ts_str}");
+    let full = format!("{year} {syslog_ts}");
     if let Ok(naive) = NaiveDateTime::parse_from_str(&full, "%Y %b %d %H:%M:%S") {
         return Some(naive.and_utc());
     }
     None
+}
+
+/// Strip a leading RFC 3164 `<PRI>` (e.g. `<34>`) if present. Returns the
+/// original string unchanged when there is no PRI prefix.
+fn strip_pri(s: &str) -> &str {
+    if s.starts_with('<') {
+        if let Some(idx) = s.find('>') {
+            return &s[idx + 1..];
+        }
+    }
+    s
 }
 
 /// Parse a single log line, returning its timestamp in UTC if the line STARTS
@@ -145,14 +161,16 @@ pub fn parse_line(line: &str) -> Option<DateTime<Utc>> {
 /// the preceding timestamped entry. Lines before the first timestamp are
 /// dropped. Mirrors Python `parse_file(source_name, lines)`.
 pub fn parse_file(source_name: &str, lines: &[String]) -> crate::models::LogSource {
-    use crate::models::{LogEntry, LogSource};
+    use crate::models::{Level, LogEntry, LogSource};
+    use crate::core::level::detect_level;
 
     let mut source = LogSource { name: source_name.to_string(), entries: Vec::new() };
     let mut current_entry: Option<LogEntry> = None;
 
     for (i, line) in lines.iter().enumerate() {
         if let Some(ts) = parse_line(line) {
-            if let Some(entry) = current_entry.take() {
+            if let Some(mut entry) = current_entry.take() {
+                entry.level = detect_level(&entry.raw_lines);
                 source.entries.push(entry);
             }
             current_entry = Some(LogEntry {
@@ -160,12 +178,14 @@ pub fn parse_file(source_name: &str, lines: &[String]) -> crate::models::LogSour
                 raw_lines: vec![line.clone()],
                 source: source_name.to_string(),
                 original_line_number: i,
+                level: Level::Unknown,
             });
         } else if let Some(entry) = current_entry.as_mut() {
             entry.raw_lines.push(line.clone());
         }
     }
-    if let Some(entry) = current_entry {
+    if let Some(mut entry) = current_entry {
+        entry.level = detect_level(&entry.raw_lines);
         source.entries.push(entry);
     }
     source

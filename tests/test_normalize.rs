@@ -56,6 +56,7 @@ fn normalize_entry_single_line() {
         raw_lines: vec!["2026-08-26 10:00:00 INFO Application started".to_string()],
         source: "app.log".to_string(),
         original_line_number: 0,
+        level: logscope::models::Level::Unknown,
     };
     let result = normalize_entry(&entry);
     assert!(result.starts_with("2026-08-26T10:00:00Z"));
@@ -76,6 +77,7 @@ fn normalize_entry_multiline() {
         ],
         source: "app.log".to_string(),
         original_line_number: 0,
+        level: logscope::models::Level::Unknown,
     };
     let result = normalize_entry(&entry);
     let lines: Vec<&str> = result.lines().collect();

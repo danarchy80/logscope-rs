@@ -106,3 +106,22 @@ fn pipeline_multiline_export() {
     let content = fs::read_to_string(&out).unwrap();
     assert!(content.contains("Traceback") && content.contains("RuntimeError: boom"));
 }
+
+#[test]
+fn pipeline_heatmap_data() {
+    let tmp = TempDir::new().unwrap();
+    let simple = write_simple(&tmp);
+    let (hm, count) = logscope::core::pipeline::run_heatmap_data(&[simple], ts(10, 0, 0), ts(11, 0, 0), None, 10).unwrap();
+    
+    assert!(hm.sources.len() >= 1);
+    assert_eq!(hm.num_buckets, 10);
+    assert!(hm.min_ts.is_some());
+    assert!(count >= 1);
+    
+    // Also assert run_heatmap_data on a nonexistent input returns Ok with an empty heatmap
+    let nonexistent = tmp.path().join("does_not_exist.log");
+    let (hm2, count2) = logscope::core::pipeline::run_heatmap_data(&[nonexistent], ts(10, 0, 0), ts(11, 0, 0), None, 10).unwrap();
+    assert!(hm2.sources.is_empty());
+    assert!(hm2.min_ts.is_none());
+    assert_eq!(count2, 0);
+}

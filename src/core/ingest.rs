@@ -30,6 +30,17 @@ use zip::ZipArchive;
 
 use crate::models::LogSource;
 use crate::core::parser::parse_file;
+use crate::core::evtx::parse_evtx;
+
+#[derive(Debug)]
+pub enum ExtractedFile {
+    Text { name: String, lines: Vec<String> },
+    Evtx { name: String, bytes: Vec<u8> },
+}
+
+fn is_evtx(name: &str) -> bool {
+    name.to_lowercase().ends_with(".evtx")
+}
 
 /// Errors surfaced by [`ingest`] / [`extract_files`].
 ///
@@ -50,11 +61,8 @@ const TAR_SUFFIXES: [&str; 7] = [
     ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".gz", ".bz2",
 ];
 
-/// Extract `(filename, lines)` pairs for every readable log file at `path`.
-///
-/// Mirrors Python `extract_files`: nonexistent → empty vec; single file or
-/// recursive directory walk with per-directory sorted files.
-pub fn extract_files(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
+/// Extract `ExtractedFile`s for every readable log file at `path`.
+pub fn extract_files(path: &Path) -> Result<Vec<ExtractedFile>, IngestError> {
     if !path.exists() {
         return Ok(vec![]);
     }
@@ -69,17 +77,26 @@ pub fn extract_files(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestEr
 
 /// Ingest a path (file, directory, or archive) into parsed [`LogSource`]s.
 pub fn ingest(path: &Path) -> Result<Vec<LogSource>, IngestError> {
-    let file_data = extract_files(path)?;
-    Ok(file_data
-        .iter()
-        .map(|(name, lines)| parse_file(name, lines))
-        .collect())
+    let files = extract_files(path)?;
+    let mut sources = Vec::new();
+    for f in files {
+        match f {
+            ExtractedFile::Text { name, lines } => sources.push(parse_file(&name, &lines)),
+            ExtractedFile::Evtx { name, bytes } => {
+                sources.push(LogSource { name: name.clone(), entries: parse_evtx(&name, &bytes)? });
+            }
+        }
+    }
+    Ok(sources)
 }
 
 /// Python `extract_files` single-file branch.
-fn extract_single(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
+fn extract_single(path: &Path) -> Result<Vec<ExtractedFile>, IngestError> {
     let name = file_name(path);
     let lower = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    if is_evtx(&name) {
+        return Ok(vec![ExtractedFile::Evtx { name, bytes: std::fs::read(path)? }]);
+    }
     if lower.ends_with(".zip") {
         return extract_zip(path);
     }
@@ -87,9 +104,9 @@ fn extract_single(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError
         if is_tar(path) {
             return extract_tar(path);
         }
-        return Ok(vec![(name, read_lines(path)?)]);
+        return Ok(vec![ExtractedFile::Text { name, lines: read_lines(path)? }]);
     }
-    Ok(vec![(name, read_lines(path)?)])
+    Ok(vec![ExtractedFile::Text { name, lines: read_lines(path)? }])
 }
 
 /// Python `os.walk` branch: recurse, files sorted per directory, basename only.
@@ -97,13 +114,13 @@ fn extract_single(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError
 /// Uses a manual recursive `read_dir` (sorted) rather than `walkdir` so the
 /// per-directory sort order matches Python exactly; walkdir's own ordering is
 /// not guaranteed to interleave dirs/files the same way.
-fn extract_dir(root: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
+fn extract_dir(root: &Path) -> Result<Vec<ExtractedFile>, IngestError> {
     let mut results = Vec::new();
     walk_dir(root, &mut results)?;
     Ok(results)
 }
 
-fn walk_dir(dir: &Path, results: &mut Vec<(String, Vec<String>)>) -> Result<(), IngestError> {
+fn walk_dir(dir: &Path, results: &mut Vec<ExtractedFile>) -> Result<(), IngestError> {
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         entries.push(entry?.path());
@@ -115,12 +132,15 @@ fn walk_dir(dir: &Path, results: &mut Vec<(String, Vec<String>)>) -> Result<(), 
     for p in &entries {
         if p.is_file() {
             let lower = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-            if lower.ends_with(".zip") {
+            let name = file_name(p);
+            if is_evtx(&name) {
+                results.push(ExtractedFile::Evtx { name, bytes: std::fs::read(p)? });
+            } else if lower.ends_with(".zip") {
                 results.extend(extract_zip(p)?);
             } else if TAR_SUFFIXES.iter().any(|s| lower.ends_with(s)) && is_tar(p) {
                 results.extend(extract_tar(p)?);
             } else {
-                results.push((file_name(p), read_lines(p)?));
+                results.push(ExtractedFile::Text { name, lines: read_lines(p)? });
             }
         }
     }
@@ -189,7 +209,7 @@ fn is_tar(path: &Path) -> bool {
 
 /// Python `_extract_zip`: members sorted by name, directory entries skipped,
 /// member read failures skipped (best-effort). Basename only.
-fn extract_zip(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
+fn extract_zip(path: &Path) -> Result<Vec<ExtractedFile>, IngestError> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
@@ -209,7 +229,12 @@ fn extract_zip(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
             }
             Err(_) => continue,
         }
-        results.push((basename(&name), String::from_utf8_lossy(&data).lines().map(String::from).collect()));
+        let base = basename(&name);
+        if is_evtx(&base) {
+            results.push(ExtractedFile::Evtx { name: base, bytes: data });
+        } else {
+            results.push(ExtractedFile::Text { name: base, lines: String::from_utf8_lossy(&data).lines().map(String::from).collect() });
+        }
     }
     Ok(results)
 }
@@ -220,7 +245,7 @@ fn extract_zip(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
 /// Single pass: read each regular member's bytes while iterating, then sort
 /// the collected `(name, data)` pairs by member name — same observable order
 /// as Python's sort-then-read, without re-opening the archive per member.
-fn extract_tar(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
+fn extract_tar(path: &Path) -> Result<Vec<ExtractedFile>, IngestError> {
     let reader = open_tar_reader(path)?;
     let mut archive = TarArchive::new(reader);
     let mut collected: Vec<(String, Vec<u8>)> = Vec::new();
@@ -243,10 +268,15 @@ fn extract_tar(path: &Path) -> Result<Vec<(String, Vec<String>)>, IngestError> {
     Ok(collected
         .into_iter()
         .map(|(name, data)| {
-            (
-                basename(&name),
-                String::from_utf8_lossy(&data).lines().map(String::from).collect(),
-            )
+            let base = basename(&name);
+            if is_evtx(&base) {
+                ExtractedFile::Evtx { name: base, bytes: data }
+            } else {
+                ExtractedFile::Text {
+                    name: base,
+                    lines: String::from_utf8_lossy(&data).lines().map(String::from).collect(),
+                }
+            }
         })
         .collect())
 }

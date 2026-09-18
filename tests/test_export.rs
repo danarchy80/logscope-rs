@@ -19,6 +19,7 @@ fn entry(h: u32, mi: u32, raw: &str, source: &str) -> LogEntry {
         raw_lines: vec![raw.to_string()],
         source: source.to_string(),
         original_line_number: 0,
+        level: logscope::models::Level::Unknown,
     }
 }
 
@@ -61,6 +62,7 @@ fn format_multiline_entry() {
         ],
         source: "app.log".to_string(),
         original_line_number: 0,
+        level: logscope::models::Level::Unknown,
     };
     let result = format_entries(&[e]);
     let lines: Vec<&str> = result.lines().collect();

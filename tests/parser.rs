@@ -71,6 +71,16 @@ fn test_parse_syslog_no_year() {
 }
 
 #[test]
+fn test_parse_syslog_with_pri() {
+    // RFC 3164 <PRI> prefix (e.g. "<34>") precedes the syslog timestamp; the
+    // timestamp is NOT at position 0, but must still parse.
+    let ts = parse_line("<34>Aug 26 10:00:00 myhost sshd: failed").expect("should parse PRI syslog");
+    assert_eq!(ts.month(), 8);
+    assert_eq!(ts.day(), 26);
+    assert_eq!(ts.hour(), 10);
+}
+
+#[test]
 fn test_no_timestamp_line() {
     assert!(parse_line("This line has no timestamp").is_none());
 }

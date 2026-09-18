@@ -88,3 +88,70 @@ fn filter_timezone_aware() {
     let result = filter_entries(&[source], ts(2026, 8, 26, 10, 0, 0), ts(2026, 8, 26, 10, 5, 0));
     assert!(result.len() >= 3);
 }
+
+#[test]
+fn filter_with_options_level() {
+    let source = parse_file("simple.log", &lines(SIMPLE_LOG));
+    let opts = logscope::core::filter::FilterOptions {
+        start: ts(2026, 8, 26, 10, 0, 0),
+        end: ts(2026, 8, 26, 10, 15, 0),
+        levels: Some(vec![logscope::models::Level::Error]),
+        sources: None,
+        search: None,
+    };
+    let result = logscope::core::filter::filter_entries_with_options(&[source], &opts);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].level, logscope::models::Level::Error);
+}
+
+#[test]
+fn filter_with_options_source() {
+    let mut source1 = parse_file("auth.log", &lines(SIMPLE_LOG));
+    let mut source2 = parse_file("app.log", &lines(SIMPLE_LOG));
+    source1.name = "auth.log".to_string();
+    for e in &mut source1.entries { e.source = "auth.log".to_string(); }
+    source2.name = "app.log".to_string();
+    for e in &mut source2.entries { e.source = "app.log".to_string(); }
+    
+    let opts = logscope::core::filter::FilterOptions {
+        start: ts(2026, 8, 26, 10, 0, 0),
+        end: ts(2026, 8, 26, 10, 15, 0),
+        levels: None,
+        sources: Some(vec!["auth".to_string()]),
+        search: None,
+    };
+    let result = logscope::core::filter::filter_entries_with_options(&[source1, source2], &opts);
+    assert_eq!(result.len(), 6);
+    for e in result {
+        assert_eq!(e.source, "auth.log");
+    }
+}
+
+#[test]
+fn filter_with_options_search_match() {
+    let source = parse_file("simple.log", &lines(SIMPLE_LOG));
+    let opts = logscope::core::filter::FilterOptions {
+        start: ts(2026, 8, 26, 10, 0, 0),
+        end: ts(2026, 8, 26, 10, 15, 0),
+        levels: None,
+        sources: None,
+        search: Some("timeout".to_string()),
+    };
+    let result = logscope::core::filter::filter_entries_with_options(&[source], &opts);
+    assert_eq!(result.len(), 1);
+    assert!(result[0].raw_lines.join("\n").to_lowercase().contains("timeout"));
+}
+
+#[test]
+fn filter_with_options_search_no_match() {
+    let source = parse_file("simple.log", &lines(SIMPLE_LOG));
+    let opts = logscope::core::filter::FilterOptions {
+        start: ts(2026, 8, 26, 10, 0, 0),
+        end: ts(2026, 8, 26, 10, 15, 0),
+        levels: None,
+        sources: None,
+        search: Some("nomatchzzz".to_string()),
+    };
+    let result = logscope::core::filter::filter_entries_with_options(&[source], &opts);
+    assert!(result.is_empty());
+}
