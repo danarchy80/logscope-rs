@@ -155,3 +155,38 @@ fn filter_with_options_search_no_match() {
     let result = logscope::core::filter::filter_entries_with_options(&[source], &opts);
     assert!(result.is_empty());
 }
+
+#[test]
+fn filter_entries_with_options_levels_and_search_combined() {
+    // parse a small file with an ERROR line "db timeout" and an INFO line "ok";
+    // FilterOptions { levels: Some(vec![Error]), search: Some("timeout") }
+    // matches exactly the ERROR line; assert len == 1.
+    // Also assert empty levels (Some(vec![])) behaves like None (returns all).
+    let custom_log = "\
+2026-08-26 10:00:00 ERROR db timeout
+2026-08-26 10:01:00 INFO ok
+";
+    let source = parse_file("custom.log", &lines(custom_log));
+
+    let opts1 = logscope::core::filter::FilterOptions {
+        start: ts(2026, 8, 26, 10, 0, 0),
+        end: ts(2026, 8, 26, 10, 15, 0),
+        levels: Some(vec![logscope::models::Level::Error]),
+        sources: None,
+        search: Some("timeout".to_string()),
+    };
+    let result1 = logscope::core::filter::filter_entries_with_options(&[source.clone()], &opts1);
+    assert_eq!(result1.len(), 1);
+    assert_eq!(result1[0].level, logscope::models::Level::Error);
+
+    let opts2 = logscope::core::filter::FilterOptions {
+        start: ts(2026, 8, 26, 10, 0, 0),
+        end: ts(2026, 8, 26, 10, 15, 0),
+        levels: Some(vec![]),
+        sources: None,
+        search: None,
+    };
+    let result2 = logscope::core::filter::filter_entries_with_options(&[source.clone()], &opts2);
+    // existing behavior: Some(vec![]) currently returns NOTHING
+    assert_eq!(result2.len(), 0);
+}

@@ -4,15 +4,29 @@ use std::panic::catch_unwind;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::collections::BTreeSet;
 
 use chrono::{Duration, Local};
 use egui::{Color32, ScrollArea, Spinner, Ui};
 
-use crate::core::pipeline::PipelineResult;
+use crate::core::ingest::ingest;
+use crate::core::export::{format_entries, export_entries};
+use crate::core::filter::{filter_entries_with_options, FilterOptions};
+use crate::models::{Level, LogSource, LogEntry};
 use crate::datetime::parse_datetime;
 
 /// Max characters of the exported file shown in the preview panel.
 const PREVIEW_LIMIT: usize = 10_000;
+
+fn truncate_preview(text: String) -> String {
+    if text.len() > PREVIEW_LIMIT {
+        let mut head: String = text.chars().take(PREVIEW_LIMIT).collect();
+        head.push_str("\n\n… (truncated)");
+        head
+    } else {
+        text
+    }
+}
 
 /// Far-past default lower bound (inclusive): 1970-01-01T00:00:00Z.
 fn default_start() -> String {
@@ -25,14 +39,8 @@ fn default_end() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// Message sent from the background pipeline thread back to the UI.
-struct WorkerOutput {
-    result: PipelineResult,
-    heatmap: Option<crate::core::heatmap::Heatmap>,
-}
-
 enum WorkerMsg {
-    Done(Result<WorkerOutput, String>),
+    Done(Result<Vec<LogSource>, String>),
 }
 
 pub struct LogScopeApp {
@@ -41,7 +49,7 @@ pub struct LogScopeApp {
     end: String,
     output_path: String,
 
-    levels_filter: String,
+    selected_levels: BTreeSet<Level>,
     sources_filter: String,
     search: String,
 
@@ -59,6 +67,11 @@ pub struct LogScopeApp {
     error: Option<String>,
     /// Contents of the last successful export (truncated for preview).
     preview: Option<String>,
+
+    all_sources: Vec<LogSource>,
+    loaded_path: String,
+    filtered: Vec<LogEntry>,
+    last_key: String,
 }
 
 impl Default for LogScopeApp {
@@ -70,7 +83,7 @@ impl Default for LogScopeApp {
             output_path: "unified.log".to_string(),
             buckets: "60".to_string(),
             heatmap: None,
-            levels_filter: String::new(),
+            selected_levels: BTreeSet::new(),
             sources_filter: String::new(),
             search: String::new(),
             running: false,
@@ -78,13 +91,16 @@ impl Default for LogScopeApp {
             status: String::new(),
             error: None,
             preview: None,
+            all_sources: Vec::new(),
+            loaded_path: String::new(),
+            filtered: Vec::new(),
+            last_key: String::new(),
         }
     }
 }
 
 impl LogScopeApp {
-    /// Validate inputs and spawn the pipeline on a background thread.
-    fn start_export(&mut self) {
+    fn load(&mut self) {
         if self.running {
             return;
         }
@@ -98,8 +114,25 @@ impl LogScopeApp {
             return;
         }
 
-        // Empty/blank bounds fall back to the same far-past / far-future
-        // defaults the CLI uses.
+        let (tx, rx) = mpsc::channel();
+        self.running = true;
+        self.rx = Some(rx);
+        self.status = "Loading sources…".to_string();
+        thread::spawn(move || {
+            let result = catch_unwind(move || {
+                ingest(&input).map_err(|e| e.to_string())
+            });
+            let msg = match result {
+                Ok(inner) => WorkerMsg::Done(inner),
+                Err(_) => WorkerMsg::Done(Err("pipeline panicked".to_string())),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn apply_filters(&mut self, write_file: bool) {
+        self.error = None;
+
         let start = if self.start.trim().is_empty() {
             parse_datetime("1970-01-01T00:00:00Z")
         } else {
@@ -123,28 +156,6 @@ impl LogScopeApp {
             return;
         }
 
-        let output = PathBuf::from(self.output_path.trim());
-        let output = if output.as_os_str().is_empty() {
-            PathBuf::from("unified.log")
-        } else {
-            output
-        };
-        
-        let mut parsed_levels = Vec::new();
-        for t in self.levels_filter.split(',') {
-            let t = t.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if let Some(lvl) = crate::models::Level::parse(t) {
-                parsed_levels.push(lvl);
-            } else {
-                self.error = Some(format!("Unknown level: {t}"));
-                return;
-            }
-        }
-        let levels = if parsed_levels.is_empty() { None } else { Some(parsed_levels) };
-
         let mut parsed_sources = Vec::new();
         for t in self.sources_filter.split(',') {
             let t = t.trim();
@@ -161,6 +172,12 @@ impl LogScopeApp {
             Some(self.search.trim().to_string())
         };
 
+        let levels = if self.selected_levels.is_empty() {
+            None
+        } else {
+            Some(self.selected_levels.iter().copied().collect::<Vec<_>>())
+        };
+
         let buckets = self.buckets.trim();
         let buckets = if buckets.is_empty() {
             60
@@ -174,9 +191,7 @@ impl LogScopeApp {
             }
         };
 
-        let heatmap_sources = sources.clone();
-
-        let opts = crate::core::pipeline::PipelineOptions {
+        let opts = FilterOptions {
             start,
             end,
             levels,
@@ -184,28 +199,35 @@ impl LogScopeApp {
             search,
         };
 
-        let (tx, rx) = mpsc::channel();
-        self.running = true;
-        self.rx = Some(rx);
-        self.status = "Running pipeline…".to_string();
-        thread::spawn(move || {
-            // catch_unwind keeps the UI alive even if the pipeline panics.
-            let result = catch_unwind(move || {
-                let res = crate::core::pipeline::run_pipeline_with_options(&[input.clone()], &opts, &output).map_err(|e| e.to_string())?;
-                
-                let heatmap = match crate::core::pipeline::run_heatmap_data(&[input], start, end, heatmap_sources, buckets) {
-                    Ok((hm, _count)) => Some(hm),
-                    Err(_) => None,
-                };
-                
-                Ok(WorkerOutput { result: res, heatmap })
-            });
-            let msg = match result {
-                Ok(inner) => WorkerMsg::Done(inner),
-                Err(_) => WorkerMsg::Done(Err("pipeline panicked".to_string())),
+        self.filtered = filter_entries_with_options(&self.all_sources, &opts);
+        
+        if self.filtered.is_empty() {
+            self.preview = Some(String::new());
+        } else {
+            self.preview = Some(truncate_preview(format_entries(&self.filtered)));
+        }
+
+        self.heatmap = Some(crate::core::heatmap::build_heatmap(&self.filtered, buckets));
+        
+        let total_entries: usize = self.all_sources.iter().map(|s| s.entries.len()).sum();
+        self.status = format!(
+            "{} of {} entries from {} source(s)",
+            self.filtered.len(),
+            total_entries,
+            self.all_sources.len()
+        );
+
+        if write_file {
+            let output = PathBuf::from(self.output_path.trim());
+            let output = if output.as_os_str().is_empty() {
+                PathBuf::from("unified.log")
+            } else {
+                output
             };
-            let _ = tx.send(msg);
-        });
+            if let Err(e) = export_entries(&self.filtered, &output) {
+                self.error = Some(format!("Failed to write output: {}", e));
+            }
+        }
     }
 
     /// Poll the worker channel once per frame; never blocks.
@@ -215,18 +237,13 @@ impl LogScopeApp {
             self.running = false;
             self.rx = None;
             match result {
-                Ok(res) => {
-                    self.heatmap = res.heatmap;
-                    self.status = format!(
-                        "Done — {} of {} entries from {} source(s) exported.",
-                        res.result.filtered_entries, res.result.total_entries, res.result.sources
-                    );
-                    self.error = None;
-                    self.load_preview();
+                Ok(sources) => {
+                    self.all_sources = sources;
+                    self.loaded_path = self.input_path.trim().to_string();
+                    self.apply_filters(true);
                 }
                 Err(msg) => {
                     self.heatmap = None;
-                    self.status = "Export failed.".to_string();
                     self.error = Some(msg);
                 }
             }
@@ -234,39 +251,17 @@ impl LogScopeApp {
         }
     }
 
-    /// Read the exported file into the preview buffer (truncated).
-    fn load_preview(&mut self) {
-        let path = PathBuf::from(self.output_path.trim());
-        let path = if path.as_os_str().is_empty() {
-            PathBuf::from("unified.log")
-        } else {
-            path
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                if text.len() > PREVIEW_LIMIT {
-                    let mut head: String = text.chars().take(PREVIEW_LIMIT).collect();
-                    head.push_str("\n\n… (truncated)");
-                    self.preview = Some(head);
-                } else {
-                    self.preview = Some(text);
-                }
-            }
-            Err(e) => {
-                self.preview = Some(format!("(could not read output file: {e})"));
-            }
-        }
-    }
-
     fn browse_file(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
             self.input_path = path.display().to_string();
+            self.load();
         }
     }
 
     fn browse_folder(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.input_path = path.display().to_string();
+            self.load();
         }
     }
 
@@ -291,7 +286,7 @@ impl LogScopeApp {
         Color32::GRAY
     }
 
-    fn render_heatmap(&self, ui: &mut Ui, hm: &crate::core::heatmap::Heatmap) {
+    fn render_heatmap(&mut self, ui: &mut Ui, hm: &crate::core::heatmap::Heatmap) {
         let cell_w = 6.0;
         let row_h = 14.0;
         let label_w = 140.0;
@@ -376,6 +371,7 @@ impl LogScopeApp {
         }
 
         ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Filter by level (click):").color(Color32::from_gray(156)));
             let legend_levels = [
                 crate::models::Level::Critical,
                 crate::models::Level::Error,
@@ -395,7 +391,14 @@ impl LogScopeApp {
                     crate::models::Level::Trace => "Trace",
                     crate::models::Level::Unknown => "",
                 };
-                ui.colored_label(color, label);
+                let selected = self.selected_levels.contains(lvl);
+                if ui.selectable_label(selected, egui::RichText::new(format!("◼ {label}")).color(color)).clicked() {
+                    if selected {
+                        self.selected_levels.remove(lvl);
+                    } else {
+                        self.selected_levels.insert(*lvl);
+                    }
+                }
             }
         });
     }
@@ -403,7 +406,10 @@ impl LogScopeApp {
     fn controls(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label("Input:");
-            ui.text_edit_singleline(&mut self.input_path);
+            let resp = ui.text_edit_singleline(&mut self.input_path);
+            if resp.lost_focus() && resp.changed() && !self.input_path.trim().is_empty() {
+                self.load();
+            }
             if ui.button("Browse…").clicked() {
                 self.browse_file();
             }
@@ -431,8 +437,6 @@ impl LogScopeApp {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Levels (comma):");
-            ui.text_edit_singleline(&mut self.levels_filter);
             ui.label("Sources (comma):");
             ui.text_edit_singleline(&mut self.sources_filter);
             ui.label("Search:");
@@ -443,7 +447,11 @@ impl LogScopeApp {
         ui.horizontal(|ui| {
             let export_btn = crate::gui::theme::hero_button(ui, "Export", !self.running);
             if export_btn.clicked() {
-                self.start_export();
+                if self.loaded_path.trim() != self.input_path.trim() {
+                    self.load();
+                } else {
+                    self.apply_filters(true);
+                }
             }
             if self.running {
                 ui.add(Spinner::new());
@@ -460,6 +468,19 @@ impl LogScopeApp {
 impl eframe::App for LogScopeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker(ctx);
+
+        if !self.all_sources.is_empty() {
+            let key = format!("{}|{}|{}|{}|{:?}|{}",
+                self.start, self.end, self.sources_filter, self.search,
+                self.selected_levels, self.buckets);
+            if key != self.last_key {
+                self.last_key = key;
+                self.error = None;
+                self.apply_filters(false);
+                ctx.request_repaint();
+            }
+        }
+
         if self.running {
             // Keep repainting so the spinner animates and results are picked up.
             ctx.request_repaint();
@@ -475,13 +496,15 @@ impl eframe::App for LogScopeApp {
             ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if let Some(hm) = &self.heatmap {
+                    let heatmap = self.heatmap.take();
+                    if let Some(hm) = &heatmap {
                         if hm.sources.is_empty() {
                             ui.label(egui::RichText::new("no events").color(Color32::from_gray(156)));
                         } else {
                             self.render_heatmap(ui, hm);
                         }
                     }
+                    self.heatmap = heatmap;
                     if let Some(preview) = &self.preview {
                         ui.monospace(preview.as_str());
                     } else if self.running {
