@@ -6,7 +6,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::collections::BTreeSet;
 
-use chrono::{Duration, Local};
 use egui::{Color32, ScrollArea, Spinner, Ui};
 
 use crate::core::ingest::ingest;
@@ -28,16 +27,15 @@ fn truncate_preview(text: String) -> String {
     }
 }
 
-/// Far-past default lower bound (inclusive): 1970-01-01T00:00:00Z.
-fn default_start() -> String {
-    let yesterday = Local::now().date_naive() - Duration::days(1);
-    format!("{} 00:00:00", yesterday.format("%Y-%m-%d"))
-}
-
-/// Default upper bound: now.
-fn default_end() -> String {
-    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
+/// Level toggles in display order (most severe first).
+const LEVEL_ORDER: [Level; 6] = [
+    Level::Critical,
+    Level::Error,
+    Level::Warning,
+    Level::Info,
+    Level::Debug,
+    Level::Trace,
+];
 
 enum WorkerMsg {
     Done(Result<Vec<LogSource>, String>),
@@ -78,8 +76,11 @@ impl Default for LogScopeApp {
     fn default() -> Self {
         Self {
             input_path: String::new(),
-            start: default_start(),
-            end: default_end(),
+            // Empty start/end = unbounded (far-past / far-future). Defaulting to
+            // "yesterday→now" silently hid older logs on load, which read as
+            // broken filtering.
+            start: String::new(),
+            end: String::new(),
             output_path: "unified.log".to_string(),
             buckets: "60".to_string(),
             heatmap: None,
@@ -369,38 +370,6 @@ impl LogScopeApp {
                 Color32::from_gray(156),
             );
         }
-
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Filter by level (click):").color(Color32::from_gray(156)));
-            let legend_levels = [
-                crate::models::Level::Critical,
-                crate::models::Level::Error,
-                crate::models::Level::Warning,
-                crate::models::Level::Info,
-                crate::models::Level::Debug,
-                crate::models::Level::Trace,
-            ];
-            for lvl in legend_levels.iter() {
-                let color = self.hex_color(crate::core::heatmap::level_color(*lvl));
-                let label = match lvl {
-                    crate::models::Level::Critical => "Critical",
-                    crate::models::Level::Error => "Error",
-                    crate::models::Level::Warning => "Warning",
-                    crate::models::Level::Info => "Info",
-                    crate::models::Level::Debug => "Debug",
-                    crate::models::Level::Trace => "Trace",
-                    crate::models::Level::Unknown => "",
-                };
-                let selected = self.selected_levels.contains(lvl);
-                if ui.selectable_label(selected, egui::RichText::new(format!("◼ {label}")).color(color)).clicked() {
-                    if selected {
-                        self.selected_levels.remove(lvl);
-                    } else {
-                        self.selected_levels.insert(*lvl);
-                    }
-                }
-            }
-        });
     }
 
     fn controls(&mut self, ui: &mut Ui) {
@@ -443,6 +412,29 @@ impl LogScopeApp {
             ui.text_edit_singleline(&mut self.search);
             ui.label("Buckets:");
             ui.text_edit_singleline(&mut self.buckets);
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Levels (click):").color(Color32::from_gray(200)));
+            for lvl in LEVEL_ORDER.iter() {
+                let color = self.hex_color(crate::core::heatmap::level_color(*lvl));
+                let label = match lvl {
+                    Level::Critical => "Critical",
+                    Level::Error => "Error",
+                    Level::Warning => "Warning",
+                    Level::Info => "Info",
+                    Level::Debug => "Debug",
+                    Level::Trace => "Trace",
+                    Level::Unknown => "",
+                };
+                let selected = self.selected_levels.contains(lvl);
+                if ui.selectable_label(selected, egui::RichText::new(format!("◼ {label}")).color(color)).clicked() {
+                    if selected {
+                        self.selected_levels.remove(lvl);
+                    } else {
+                        self.selected_levels.insert(*lvl);
+                    }
+                }
+            }
         });
         ui.horizontal(|ui| {
             let export_btn = crate::gui::theme::hero_button(ui, "Export", !self.running);
