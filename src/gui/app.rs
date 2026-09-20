@@ -12,6 +12,7 @@ use crate::core::workspace::Workspace;
 use crate::core::ingest::ingest;
 use crate::core::export::{format_entries, export_entries};
 use crate::core::filter::{filter_entries_with_options, FilterOptions};
+use crate::core::sanitize::SanitizeConfig;
 use crate::models::{Level, LogSource, LogEntry};
 use crate::datetime::parse_datetime;
 
@@ -57,6 +58,10 @@ pub struct LogScopeApp {
     /// Receiver for the worker thread's result (None when idle).
     rx: Option<Receiver<WorkerMsg>>,
 
+    sanitize: SanitizeConfig,
+    sanitize_text: String,
+    sanitize_accounts: String,
+
     buckets: String,
     heatmap: Option<crate::core::heatmap::Heatmap>,
 
@@ -84,6 +89,9 @@ impl Default for LogScopeApp {
             start: String::new(),
             end: String::new(),
             output_path: "unified.log".to_string(),
+            sanitize: SanitizeConfig::default(),
+            sanitize_text: String::new(),
+            sanitize_accounts: String::new(),
             buckets: "60".to_string(),
             heatmap: None,
             selected_levels: BTreeSet::new(),
@@ -253,8 +261,25 @@ impl LogScopeApp {
             search,
         };
 
+        // Parse sanitize fields
+        self.sanitize.system_names = self.sanitize_text
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.sanitize.account_names = self.sanitize_accounts
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         self.filtered = filter_entries_with_options(&self.all_sources, &opts);
         
+        // Apply sanitization if active
+        if self.sanitize.is_active() {
+            crate::core::sanitize::sanitize_entries(&mut self.filtered, &self.sanitize);
+        }
+
         if self.filtered.is_empty() {
             self.preview = Some(String::new());
         } else {
@@ -520,6 +545,16 @@ impl LogScopeApp {
                     }
                 }
             }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.sanitize.redact_ips, "Redact IPs")
+                .on_hover_text("Replace IPv4 and IPv6 addresses with [REDACTED_IP].");
+            ui.label("Systems (comma):");
+            ui.text_edit_singleline(&mut self.sanitize_text)
+                .on_hover_text("Comma-separated system/host names to redact (case-insensitive).");
+            ui.label("Accounts (comma):");
+            ui.text_edit_singleline(&mut self.sanitize_accounts)
+                .on_hover_text("Comma-separated account/user names to redact (case-insensitive).");
         });
         ui.horizontal(|ui| {
             let export_btn = crate::gui::theme::hero_button(ui, "Export", !self.running)
