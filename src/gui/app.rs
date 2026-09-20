@@ -416,13 +416,19 @@ impl LogScopeApp {
 
     fn controls(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if ui.add_enabled(!self.running, egui::Button::new("Add Files…")).clicked() {
+            if ui.add_enabled(!self.running, egui::Button::new("Add Files…"))
+                .on_hover_text("Add one or more log files, .evtx, or .zip/.tar archives. Multi-select with Ctrl/Shift-click.")
+                .clicked() {
                 self.add_files();
             }
-            if ui.add_enabled(!self.running, egui::Button::new("Add Folder…")).clicked() {
+            if ui.add_enabled(!self.running, egui::Button::new("Add Folder…"))
+                .on_hover_text("Add a folder — every log file inside is parsed recursively.")
+                .clicked() {
                 self.add_folder();
             }
-            if ui.add_enabled(!self.running, egui::Button::new("Clear")).clicked() {
+            if ui.add_enabled(!self.running, egui::Button::new("Clear"))
+                .on_hover_text("Remove all inputs from the workspace.")
+                .clicked() {
                 self.clear_workspace();
             }
         });
@@ -443,7 +449,9 @@ impl LogScopeApp {
                     let label = format!("{}  ({} sources, {} entries)", path, sources_len, total);
                     ui.label(label);
                     ui.add_enabled_ui(!self.running, |ui| {
-                        if ui.small_button("✖ Remove").clicked() {
+                        if ui.small_button("✖ Remove")
+                            .on_hover_text("Remove this input from the workspace.")
+                            .clicked() {
                             remove_idx = Some(idx);
                         }
                     });
@@ -458,27 +466,35 @@ impl LogScopeApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.start)
                     .hint_text("YYYY-MM-DD HH:MM:SS"),
-            );
+            )
+            .on_hover_text("Start of the time window (inclusive). Blank = include all earlier logs.");
             ui.label("End:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.end)
                     .hint_text("YYYY-MM-DD HH:MM:SS"),
-            );
+            )
+            .on_hover_text("End of the time window (inclusive). Blank = include all later logs.");
         });
         ui.horizontal(|ui| {
             ui.label("Output:");
-            ui.text_edit_singleline(&mut self.output_path);
-            if ui.button("Save…").clicked() {
+            ui.text_edit_singleline(&mut self.output_path)
+                .on_hover_text("Path of the unified log file written on Export.");
+            if ui.button("Save…")
+                .on_hover_text("Choose where the unified log file is written.")
+                .clicked() {
                 self.browse_save();
             }
         });
         ui.horizontal(|ui| {
             ui.label("Sources (comma):");
-            ui.text_edit_singleline(&mut self.sources_filter);
+            ui.text_edit_singleline(&mut self.sources_filter)
+                .on_hover_text("Only show these source names, comma-separated (case-insensitive). Blank = all sources.");
             ui.label("Search:");
-            ui.text_edit_singleline(&mut self.search);
+            ui.text_edit_singleline(&mut self.search)
+                .on_hover_text("Case-insensitive substring match on the raw log message");
             ui.label("Buckets:");
-            ui.text_edit_singleline(&mut self.buckets);
+            ui.text_edit_singleline(&mut self.buckets)
+                .on_hover_text("Number of time columns in the heatmap.");
         });
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Levels (click):").color(Color32::from_gray(200)));
@@ -494,7 +510,9 @@ impl LogScopeApp {
                     Level::Unknown => "",
                 };
                 let selected = self.selected_levels.contains(lvl);
-                if ui.selectable_label(selected, egui::RichText::new(format!("◼ {label}")).color(color)).clicked() {
+                if ui.selectable_label(selected, egui::RichText::new(format!("◼ {label}")).color(color))
+                    .on_hover_text(format!("Include/exclude {label}-level entries."))
+                    .clicked() {
                     if selected {
                         self.selected_levels.remove(lvl);
                     } else {
@@ -504,7 +522,8 @@ impl LogScopeApp {
             }
         });
         ui.horizontal(|ui| {
-            let export_btn = crate::gui::theme::hero_button(ui, "Export", !self.running);
+            let export_btn = crate::gui::theme::hero_button(ui, "Export", !self.running)
+                .on_hover_text("Write the filtered, time-synchronized logs to the output file.");
             if export_btn.clicked() {
                 self.apply_filters(true);
             }
