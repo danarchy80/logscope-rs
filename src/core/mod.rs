@@ -10,3 +10,4 @@ pub mod level;
 pub mod normalize;
 pub mod parser;
 pub mod pipeline;
+pub mod workspace;

@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use egui::{Color32, ScrollArea, Spinner, Ui};
 
+use crate::core::workspace::Workspace;
 use crate::core::ingest::ingest;
 use crate::core::export::{format_entries, export_entries};
 use crate::core::filter::{filter_entries_with_options, FilterOptions};
@@ -38,11 +39,11 @@ const LEVEL_ORDER: [Level; 6] = [
 ];
 
 enum WorkerMsg {
-    Done(Result<Vec<LogSource>, String>),
+    /// One entry per ingested path: (display path, result).
+    Done(Vec<(String, Result<Vec<LogSource>, String>)>),
 }
 
 pub struct LogScopeApp {
-    input_path: String,
     start: String,
     end: String,
     output_path: String,
@@ -66,8 +67,10 @@ pub struct LogScopeApp {
     /// Contents of the last successful export (truncated for preview).
     preview: Option<String>,
 
+    /// Ordered inputs and their parsed sources. Single source of truth.
+    workspace: Workspace,
+    /// Cached flattened view of `workspace.merged_sources()`; rebuilt on add/remove.
     all_sources: Vec<LogSource>,
-    loaded_path: String,
     filtered: Vec<LogEntry>,
     last_key: String,
 }
@@ -75,7 +78,6 @@ pub struct LogScopeApp {
 impl Default for LogScopeApp {
     fn default() -> Self {
         Self {
-            input_path: String::new(),
             // Empty start/end = unbounded (far-past / far-future). Defaulting to
             // "yesterday→now" silently hid older logs on load, which read as
             // broken filtering.
@@ -92,8 +94,8 @@ impl Default for LogScopeApp {
             status: String::new(),
             error: None,
             preview: None,
+            workspace: Workspace::new(),
             all_sources: Vec::new(),
-            loaded_path: String::new(),
             filtered: Vec::new(),
             last_key: String::new(),
         }
@@ -101,34 +103,85 @@ impl Default for LogScopeApp {
 }
 
 impl LogScopeApp {
-    fn load(&mut self) {
+    /// Rebuild `all_sources` from the workspace.
+    fn rebuild_merged(&mut self) {
+        self.all_sources = self.workspace.merged_sources();
+    }
+
+    /// Spawn one background thread that ingests every path in `paths` (sequentially)
+    /// and reports per-path results. Dedupes against existing workspace paths.
+    fn queue_ingest(&mut self, paths: Vec<PathBuf>) {
         if self.running {
             return;
         }
-        self.error = None;
-        self.status.clear();
-        self.preview = None;
-
-        let input = PathBuf::from(self.input_path.trim());
-        if input.as_os_str().is_empty() {
-            self.error = Some("input path is empty".to_string());
+        // Drop paths already in the workspace (exact trimmed-string match).
+        let mut to_ingest: Vec<PathBuf> = Vec::new();
+        for p in paths {
+            let disp = p.display().to_string();
+            if !self.workspace.contains(disp.trim()) && !to_ingest.iter().any(|q| q.display().to_string() == disp) {
+                to_ingest.push(p);
+            }
+        }
+        if to_ingest.is_empty() {
             return;
         }
 
-        let (tx, rx) = mpsc::channel();
+        self.error = None;
         self.running = true;
+        self.status = format!("Loading {} input(s)…", to_ingest.len());
+        let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
-        self.status = "Loading sources…".to_string();
         thread::spawn(move || {
-            let result = catch_unwind(move || {
-                ingest(&input).map_err(|e| e.to_string())
-            });
-            let msg = match result {
-                Ok(inner) => WorkerMsg::Done(inner),
-                Err(_) => WorkerMsg::Done(Err("pipeline panicked".to_string())),
-            };
-            let _ = tx.send(msg);
+            let results: Vec<(String, Result<Vec<LogSource>, String>)> = to_ingest
+                .into_iter()
+                .map(|p| {
+                    let disp = p.display().to_string();
+                    let r = catch_unwind(move || ingest(&p).map_err(|e| e.to_string()));
+                    let inner = match r {
+                        Ok(i) => i,
+                        Err(_) => Err("pipeline panicked".to_string()),
+                    };
+                    (disp, inner)
+                })
+                .collect();
+            let _ = tx.send(WorkerMsg::Done(results));
         });
+    }
+
+    /// rfd multi-file pick (files + archives; a .zip/tar is just a file).
+    fn add_files(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new().pick_files() {
+            self.queue_ingest(paths);
+        }
+    }
+
+    fn add_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.queue_ingest(vec![path]);
+        }
+    }
+
+    /// Remove a workspace item by index and re-filter.
+    fn remove_item(&mut self, index: usize) {
+        if self.workspace.remove(index).is_some() {
+            self.rebuild_merged();
+            if self.workspace.is_empty() {
+                self.preview = None;
+                self.heatmap = None;
+                self.status.clear();
+                self.last_key.clear();
+            }
+            self.apply_filters(true);
+        }
+    }
+
+    fn clear_workspace(&mut self) {
+        self.workspace.clear();
+        self.all_sources.clear();
+        self.preview = None;
+        self.heatmap = None;
+        self.status.clear();
+        self.last_key.clear();
     }
 
     fn apply_filters(&mut self, write_file: bool) {
@@ -234,37 +287,26 @@ impl LogScopeApp {
     /// Poll the worker channel once per frame; never blocks.
     fn poll_worker(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.rx.as_ref() else { return };
-        if let Ok(WorkerMsg::Done(result)) = rx.try_recv() {
+        if let Ok(WorkerMsg::Done(results)) = rx.try_recv() {
             self.running = false;
             self.rx = None;
-            match result {
-                Ok(sources) => {
-                    self.all_sources = sources;
-                    self.loaded_path = self.input_path.trim().to_string();
-                    self.apply_filters(true);
+            let mut errors: Vec<String> = Vec::new();
+            for (path, res) in results {
+                match res {
+                    Ok(sources) => self.workspace.add(path, sources),
+                    Err(msg) => errors.push(format!("{path}: {msg}")),
                 }
-                Err(msg) => {
-                    self.heatmap = None;
-                    self.error = Some(msg);
-                }
+            }
+            self.rebuild_merged();
+            self.apply_filters(true);
+            if !errors.is_empty() {
+                self.error = Some(errors.join("; "));
             }
             ctx.request_repaint();
         }
     }
 
-    fn browse_file(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_file() {
-            self.input_path = path.display().to_string();
-            self.load();
-        }
-    }
 
-    fn browse_folder(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.input_path = path.display().to_string();
-            self.load();
-        }
-    }
 
     fn browse_save(&mut self) {
         if let Some(path) = rfd::FileDialog::new().save_file() {
@@ -374,18 +416,43 @@ impl LogScopeApp {
 
     fn controls(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label("Input:");
-            let resp = ui.text_edit_singleline(&mut self.input_path);
-            if resp.lost_focus() && resp.changed() && !self.input_path.trim().is_empty() {
-                self.load();
+            if ui.add_enabled(!self.running, egui::Button::new("Add Files…")).clicked() {
+                self.add_files();
             }
-            if ui.button("Browse…").clicked() {
-                self.browse_file();
+            if ui.add_enabled(!self.running, egui::Button::new("Add Folder…")).clicked() {
+                self.add_folder();
             }
-            if ui.button("Folder…").clicked() {
-                self.browse_folder();
+            if ui.add_enabled(!self.running, egui::Button::new("Clear")).clicked() {
+                self.clear_workspace();
             }
         });
+        ui.label(egui::RichText::new("Files, .zip/.tar archives, and folders are all supported.")
+            .color(Color32::from_gray(140)));
+
+        let mut remove_idx = None;
+        if self.workspace.is_empty() {
+            ui.label(egui::RichText::new("Workspace is empty — add files or a folder.")
+                .color(Color32::from_gray(140)));
+        } else {
+            for idx in 0..self.workspace.len() {
+                let item = &self.workspace.items()[idx];
+                let path = item.path.clone();
+                let sources_len = item.sources.len();
+                let total: usize = item.sources.iter().map(|s| s.entries.len()).sum();
+                ui.horizontal(|ui| {
+                    let label = format!("{}  ({} sources, {} entries)", path, sources_len, total);
+                    ui.label(label);
+                    ui.add_enabled_ui(!self.running, |ui| {
+                        if ui.small_button("✖ Remove").clicked() {
+                            remove_idx = Some(idx);
+                        }
+                    });
+                });
+            }
+        }
+        if let Some(idx) = remove_idx {
+            self.remove_item(idx);
+        }
         ui.horizontal(|ui| {
             ui.label("Start:");
             ui.add(
@@ -439,11 +506,7 @@ impl LogScopeApp {
         ui.horizontal(|ui| {
             let export_btn = crate::gui::theme::hero_button(ui, "Export", !self.running);
             if export_btn.clicked() {
-                if self.loaded_path.trim() != self.input_path.trim() {
-                    self.load();
-                } else {
-                    self.apply_filters(true);
-                }
+                self.apply_filters(true);
             }
             if self.running {
                 ui.add(Spinner::new());
