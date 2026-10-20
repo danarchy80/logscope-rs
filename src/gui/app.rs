@@ -23,6 +23,7 @@ use crate::core::workspace::Workspace;
 use crate::core::ingest::ingest;
 use crate::core::filter::{filter_entries_with_options, FilterOptions};
 use crate::core::llm::{self, AnalysisResult, KeyEvent, LlmConfig};
+use crate::core::chat::{self, ChatMessage, ToolContext};
 use crate::core::sanitize::SanitizeConfig;
 use crate::models::{Level, LogSource, LogEntry};
 use crate::datetime::parse_datetime;
@@ -67,6 +68,8 @@ enum WorkerMsg {
     Done(Vec<(String, Result<Vec<LogSource>, String>)>),
     /// Result of a background LLM analysis request.
     LlmDone(Result<AnalysisResult, String>),
+    /// Reply (or error) of a background chat request.
+    ChatDone(Result<String, String>),
 }
 
 pub struct LogScopeApp {
@@ -120,6 +123,12 @@ pub struct LogScopeApp {
     analysis: Option<AnalysisResult>,
     analysis_status: String,
     analysis_running: bool,
+    // --- AI assistant + sanitize floating windows ---
+    show_ai_window: bool,
+    show_sanitize_window: bool,
+    chat_history: Vec<ChatMessage>,
+    chat_input: String,
+    chat_running: bool,
 }
 
 impl Default for LogScopeApp {
@@ -157,6 +166,11 @@ impl Default for LogScopeApp {
             analysis: None,
             analysis_status: String::new(),
             analysis_running: false,
+            show_ai_window: false,
+            show_sanitize_window: false,
+            chat_history: Vec::new(),
+            chat_input: String::new(),
+            chat_running: false,
         }
     }
 }
@@ -406,6 +420,8 @@ impl LogScopeApp {
             ],
         });
         self.analysis_status = "Demo analysis loaded".to_string();
+        self.show_ai_window = true;
+        self.show_sanitize_window = true;
     }
 
     /// Poll the worker channel once per frame; never blocks.
@@ -445,6 +461,19 @@ impl LogScopeApp {
                         self.error = Some(format!("LLM: {e}"));
                     }
                 }
+                ctx.request_repaint();
+            }
+            Ok(WorkerMsg::ChatDone(result)) => {
+                self.chat_running = false;
+                self.rx = None;
+                let content = match result {
+                    Ok(reply) => reply,
+                    Err(e) => format!("Error: {e}"),
+                };
+                self.chat_history.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content,
+                });
                 ctx.request_repaint();
             }
             Err(_) => {}
@@ -487,6 +516,284 @@ impl LogScopeApp {
             };
             let _ = tx.send(msg);
         });
+    }
+
+    /// Snapshot of the session for the model's tool context.
+    fn build_tool_context(&self) -> ToolContext {
+        let mut active_filters = Vec::new();
+        if !self.selected_levels.is_empty() {
+            let levels: Vec<&str> = self.selected_levels.iter().map(|l| l.as_str()).collect();
+            active_filters.push(format!("levels={}", levels.join(",")));
+        }
+        if !self.sources_filter.trim().is_empty() {
+            active_filters.push(format!("sources={}", self.sources_filter.trim()));
+        }
+        if !self.search.trim().is_empty() {
+            active_filters.push(format!("search={}", self.search.trim()));
+        }
+        ToolContext {
+            sources: self.all_sources.len(),
+            entries: self.all_sources.iter().map(|s| s.entries.len()).sum(),
+            filtered: self.filtered.len(),
+            time_start: Some(self.start.trim().to_string()).filter(|s| !s.is_empty()),
+            time_end: Some(self.end.trim().to_string()).filter(|s| !s.is_empty()),
+            active_filters,
+            redaction_active: self.sanitize.is_active(),
+            redact_ips: self.sanitize.redact_ips,
+            redact_system_names: !self.sanitize.system_names.is_empty(),
+            redact_account_names: !self.sanitize.account_names.is_empty(),
+        }
+    }
+
+    /// Send `text` to the chat endpoint with tool context + log excerpt.
+    fn start_chat(&mut self, text: String) {
+        let text = text.trim().to_string();
+        if text.is_empty()
+            || self.chat_running
+            || self.running
+            || self.analysis_running
+            || self.llm_cfg.base_url.trim().is_empty()
+            || self.llm_cfg.model.trim().is_empty()
+        {
+            return;
+        }
+        self.chat_history.push(ChatMessage { role: "user".to_string(), content: text });
+        self.chat_input.clear();
+        self.chat_running = true;
+
+        let mut system = chat::tool_context(&self.build_tool_context());
+        // Ground the model in the actual (redacted) logs when available.
+        let mut entries = self.filtered.clone();
+        if self.redact_before_send {
+            crate::core::sanitize::sanitize_entries(&mut entries, &self.sanitize);
+        }
+        if !entries.is_empty() {
+            system.push_str("\n\nLog excerpt (filtered):\n");
+            system.push_str(&llm::log_digest(&entries, 12_000));
+        }
+        let history = self.chat_history.clone();
+        let cfg = self.llm_cfg.clone();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        thread::spawn(move || {
+            let r = catch_unwind(move || chat::chat(&system, &history, &cfg));
+            let msg = match r {
+                Ok(Ok(reply)) => WorkerMsg::ChatDone(Ok(reply)),
+                Ok(Err(e)) => WorkerMsg::ChatDone(Err(e)),
+                Err(_) => WorkerMsg::ChatDone(Err("chat request panicked".to_string())),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Floating sanitize controls window (rail shield icon toggles it).
+    fn sanitize_window(&mut self, ctx: &egui::Context) {
+        if !self.show_sanitize_window {
+            return;
+        }
+        let pal = self.pal();
+        let mut open = self.show_sanitize_window;
+        egui::Window::new("Sanitization")
+            .id(egui::Id::new("sanitize_win"))
+            .open(&mut open)
+            .default_pos([320.0, 160.0])
+            .default_size([300.0, 240.0])
+            .resizable(true)
+            .frame(
+                Frame::new()
+                    .fill(pal.panel)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(6)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Applied to the unified view and to AI payloads when 'Redact before send' is on.")
+                        .size(10.5)
+                        .color(pal.text_muted),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.sanitize.redact_ips, "Redact IPs")
+                    .on_hover_text("Replace IPv4 and IPv6 addresses with [REDACTED_IP].");
+                ui.label(RichText::new("Systems (comma)").size(10.5).color(pal.text_muted));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sanitize_text)
+                        .hint_text("HOST-07, SRV-DC01")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label(RichText::new("Accounts (comma)").size(10.5).color(pal.text_muted));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sanitize_accounts)
+                        .hint_text("svc-backup")
+                        .desired_width(f32::INFINITY),
+                );
+                let active = self.sanitize.is_active();
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(if active { "Redaction active" } else { "Redaction inactive" })
+                        .size(10.5)
+                        .color(if active { pal.accent } else { pal.text_muted }),
+                );
+            });
+        self.show_sanitize_window = open;
+    }
+
+    /// Floating AI assistant window: settings, suggested actions, chat.
+    fn ai_window(&mut self, ctx: &egui::Context) {
+        if !self.show_ai_window {
+            return;
+        }
+        let pal = self.pal();
+        let mut open = self.show_ai_window;
+        let mut send_text: Option<String> = None;
+        let mut run_analysis = false;
+        egui::Window::new("AI Assistant")
+            .id(egui::Id::new("ai_win"))
+            .open(&mut open)
+            .default_pos([880.0, 120.0])
+            .default_size([430.0, 560.0])
+            .resizable(true)
+            .frame(
+                Frame::new()
+                    .fill(pal.panel)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(6)),
+            )
+            .show(ctx, |ui| {
+                // --- endpoint settings (collapsible) ---
+                ui.collapsing("Endpoint", |ui| {
+                    ui.label(RichText::new("Base URL").size(10.5).color(pal.text_muted));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.llm_cfg.base_url)
+                            .hint_text("http://192.168.50.7:8731/v1")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text("OpenAI-compatible endpoint base (…/v1). Works with local llama.cpp/Halogen servers and cloud providers.");
+                    ui.label(RichText::new("Model").size(10.5).color(pal.text_muted));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.llm_cfg.model)
+                            .hint_text("halogen-qwen3.8-flash-next")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label(RichText::new("API key (optional)").size(10.5).color(pal.text_muted));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.llm_cfg.api_key)
+                            .password(true)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text("Sent as a Bearer token. Stored in the OS keyring — never in the settings file. Leave empty for local servers.");
+                    if !self.keyring_available && !self.llm_cfg.api_key.is_empty() {
+                        ui.label(
+                            RichText::new("! OS keyring unavailable — this key stays in memory only and will not be saved.")
+                                .size(10.0)
+                                .color(pal.error),
+                        );
+                    }
+                    ui.checkbox(&mut self.redact_before_send, "Redact before send")
+                        .on_hover_text("Apply the sanitize pipeline to the payload. Keep it on for cloud providers; uncheck only for trusted local endpoints.");
+                    if self.redact_before_send && !self.sanitize.is_active() {
+                        ui.label(
+                            RichText::new("! Sanitize is off — logs will be sent unredacted.")
+                                .size(10.0)
+                                .color(pal.error),
+                        );
+                    }
+                });
+                if !self.analysis_status.is_empty() {
+                    ui.label(
+                        RichText::new(&self.analysis_status)
+                            .size(10.5)
+                            .monospace()
+                            .color(pal.text_muted),
+                    );
+                }
+                ui.add_space(4.0);
+                // --- suggested actions ---
+                ui.label(RichText::new("SUGGESTED ACTIONS").size(10.0).strong().color(pal.kicker));
+                ui.horizontal_wrapped(|ui| {
+                    for (label, prompt) in [
+                        ("Summarize logs", "Summarize the loaded logs: what happened, in order."),
+                        ("Error triage", "Which errors or warnings stand out, and what is likely the root cause?"),
+                        ("Redaction advice", "Suggest what I should redact before sharing these logs externally."),
+                    ] {
+                        if ui
+                            .add_enabled(!self.chat_running, egui::Button::new(RichText::new(label).size(10.5)))
+                            .clicked()
+                        {
+                            send_text = Some(prompt.to_string());
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.analysis_running && !self.filtered.is_empty(),
+                            egui::Button::new(RichText::new("Key-event timeline").size(10.5)),
+                        )
+                        .on_hover_text("Run the structured key-event analysis (renders the timeline panel).")
+                        .clicked()
+                    {
+                        run_analysis = true;
+                    }
+                });
+                ui.add_space(4.0);
+                // --- chat history ---
+                let hist_height = ui.available_height() - 76.0;
+                egui::ScrollArea::vertical()
+                    .id_salt("chat_hist")
+                    .max_height(hist_height.max(80.0))
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.chat_history.is_empty() {
+                            ui.label(
+                                RichText::new("Ask about the loaded logs. The model receives a description of LogScope, the current session state, and a filtered log excerpt.")
+                                    .size(10.5)
+                                    .color(pal.text_muted),
+                            );
+                        }
+                        for msg in &self.chat_history {
+                            let (tag, color) = if msg.role == "user" {
+                                ("You", pal.accent)
+                            } else {
+                                ("AI", pal.kicker)
+                            };
+                            ui.label(RichText::new(tag).size(9.5).strong().color(color));
+                            ui.label(
+                                RichText::new(&msg.content)
+                                    .size(11.0)
+                                    .color(pal.text),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        if self.chat_running {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(12.0));
+                                ui.label(RichText::new("Thinking…").size(10.5).color(pal.text_muted));
+                            });
+                        }
+                    });
+                // --- input row ---
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let re = ui.add_sized(
+                        [ui.available_width() - 54.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.chat_input)
+                            .hint_text("Ask about the logs…"),
+                    );
+                    let send = (re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || ui
+                            .add_enabled(!self.chat_running, egui::Button::new(RichText::new("Send").size(11.0)))
+                            .clicked();
+                    if send && !self.chat_input.trim().is_empty() {
+                        send_text = Some(self.chat_input.clone());
+                    }
+                });
+            });
+        self.show_ai_window = open;
+        if run_analysis {
+            self.start_analysis();
+        }
+        if let Some(t) = send_text {
+            self.start_chat(t);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -844,6 +1151,25 @@ impl LogScopeApp {
                 p.line_segment([c + Vec2::new(-5.0, -5.0), c + Vec2::new(5.0, 5.0)], s);
                 p.line_segment([c + Vec2::new(-5.0, 5.0), c + Vec2::new(5.0, -5.0)], s);
             }
+            4 => {
+                // chat bubble (AI assistant)
+                let body = Rect::from_center_size(c + Vec2::new(0.0, -1.0), Vec2::new(16.0, 11.0));
+                p.rect_stroke(body, 3.0, s, egui::epaint::StrokeKind::Middle);
+                p.line_segment([c + Vec2::new(-3.0, 4.5), c + Vec2::new(-6.0, 8.0)], s);
+            }
+            5 => {
+                // shield (sanitize)
+                let top = c.y - 7.0;
+                let pts = vec![
+                    Pos2::new(c.x - 6.0, top + 1.0),
+                    Pos2::new(c.x, top),
+                    Pos2::new(c.x + 6.0, top + 1.0),
+                    Pos2::new(c.x + 6.0, top + 6.0),
+                    Pos2::new(c.x, c.y + 7.5),
+                    Pos2::new(c.x - 6.0, top + 6.0),
+                ];
+                p.add(egui::epaint::Shape::convex_polygon(pts, egui::Color32::TRANSPARENT, s));
+            }
             _ => {
                 // half-filled circle (theme cycle)
                 let pts: Vec<Pos2> = (0..=8)
@@ -908,6 +1234,28 @@ impl LogScopeApp {
                         .clicked()
                     {
                         cycle_theme = true;
+                    }
+                    ui.add_space(10.0);
+                    ui.separator();
+                    let ai_color = if self.show_ai_window { pal.accent } else { pal.text };
+                    let r = ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new(" ").size(14.0)));
+                    Self::rail_icon(ui.painter(), r.rect, 4, ai_color);
+                    if r.on_hover_text("AI assistant — chat with your logs (opens a window).")
+                        .clicked()
+                    {
+                        self.show_ai_window = !self.show_ai_window;
+                    }
+                    let san_color = if self.sanitize.is_active() || self.show_sanitize_window {
+                        pal.accent
+                    } else {
+                        pal.text
+                    };
+                    let r = ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new(" ").size(14.0)));
+                    Self::rail_icon(ui.painter(), r.rect, 5, san_color);
+                    if r.on_hover_text("Sanitization — redact IPs, system names, and accounts (opens a window).")
+                        .clicked()
+                    {
+                        self.show_sanitize_window = !self.show_sanitize_window;
                     }
                 });
             });
@@ -983,7 +1331,7 @@ impl LogScopeApp {
                                         );
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                             if ui
-                                                .small_button("✕")
+                                                .small_button("x")
                                                 .on_hover_text("Remove this input.")
                                                 .clicked()
                                             {
@@ -1240,103 +1588,6 @@ impl LogScopeApp {
                         );
                     }
                 }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label(
-                    RichText::new("SANITIZE")
-                        .size(10.5)
-                        .strong()
-                        .color(pal.kicker),
-                );
-                ui.checkbox(&mut self.sanitize.redact_ips, "Redact IPs")
-                    .on_hover_text("Replace IPv4 and IPv6 addresses with [REDACTED_IP].");
-                ui.label(RichText::new("Systems (comma)").size(10.5).color(pal.text_muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.sanitize_text)
-                        .hint_text("HOST-07, SRV-DC01")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.label(RichText::new("Accounts (comma)").size(10.5).color(pal.text_muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.sanitize_accounts)
-                        .hint_text("svc-backup")
-                        .desired_width(f32::INFINITY),
-                );
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label(
-                    RichText::new("AI ANALYSIS")
-                        .size(10.5)
-                        .strong()
-                        .color(pal.kicker),
-                );
-                ui.label(RichText::new("Base URL").size(10.5).color(pal.text_muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.llm_cfg.base_url)
-                        .hint_text("http://192.168.50.7:8731/v1")
-                        .desired_width(f32::INFINITY),
-                )
-                .on_hover_text("OpenAI-compatible endpoint base (…/v1). Works with local llama.cpp/Halogen servers and cloud providers.");
-                ui.label(RichText::new("Model").size(10.5).color(pal.text_muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.llm_cfg.model)
-                        .hint_text("halogen-qwen3.8-flash-next")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.label(RichText::new("API key (optional)").size(10.5).color(pal.text_muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.llm_cfg.api_key)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                )
-                .on_hover_text("Sent as a Bearer token. Stored in the OS keyring (Windows Credential Manager / macOS Keychain / Linux Secret Service) — never in the settings file. Leave empty for local servers.");
-                if !self.keyring_available && !self.llm_cfg.api_key.is_empty() {
-                    ui.label(
-                        RichText::new("! OS keyring unavailable — this key stays in memory only and will not be saved.")
-                            .size(10.0)
-                            .color(pal.error),
-                    );
-                }
-                ui.checkbox(&mut self.redact_before_send, "Redact before send")
-                    .on_hover_text("Apply the sanitize pipeline above to the payload. Keep it on for cloud providers; uncheck only for trusted local endpoints.");
-                if self.redact_before_send && !self.sanitize.is_active() {
-                    ui.label(
-                        RichText::new("! Sanitize is off — logs will be sent unredacted.")
-                            .size(10.0)
-                            .color(pal.error),
-                    );
-                }
-                ui.add_space(4.0);
-                let can_analyze = !self.analysis_running
-                    && !self.running
-                    && !self.filtered.is_empty()
-                    && !self.llm_cfg.base_url.trim().is_empty()
-                    && !self.llm_cfg.model.trim().is_empty();
-                ui.horizontal(|ui| {
-                    if theme::hero_button(ui, pal, "Analyze", can_analyze)
-                        .on_hover_text(if self.filtered.is_empty() {
-                            "Load and filter logs first."
-                        } else {
-                            "Send the filtered logs to the endpoint and render a key-event timeline."
-                        })
-                        .clicked()
-                    {
-                        self.start_analysis();
-                    }
-                    if self.analysis_running {
-                        ui.add(egui::Spinner::new().size(13.0));
-                    }
-                });
-                if !self.analysis_status.is_empty() {
-                    ui.label(
-                        RichText::new(&self.analysis_status)
-                            .size(10.5)
-                            .monospace()
-                            .color(pal.text_muted),
-                    );
-                }
             });
     }
 
@@ -1514,6 +1765,10 @@ impl eframe::App for LogScopeApp {
         self.workspace_panel(ui);
         self.inspector(ui);
         self.center(ui);
+        // Floating windows render above the panel layout.
+        let ctx = ui.ctx().clone();
+        self.sanitize_window(&ctx);
+        self.ai_window(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

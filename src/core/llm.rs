@@ -81,6 +81,12 @@ pub fn build_prompt(entries: &[LogEntry], max_chars: usize) -> String {
     format!("{}\n\n{}", instruction(), body)
 }
 
+/// Render the log body (no instruction block), truncated to budget.
+/// Used as the log excerpt for chat requests.
+pub fn log_digest(entries: &[LogEntry], max_chars: usize) -> String {
+    build_body(entries, max_chars)
+}
+
 /// Render entries one per line; if over budget keep the first ~60% and last
 /// ~40% (by entry count fitting the char budget) joined by a truncation marker.
 fn build_body(entries: &[LogEntry], budget: usize) -> String {
