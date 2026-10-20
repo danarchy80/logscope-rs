@@ -390,7 +390,7 @@ impl LogScopeApp {
         };
         self.analysis = Some(AnalysisResult {
             summary: "Demo analysis: escalating failures between 08:53 and 08:57 \
-                      (thermal warning → pool exhaustion → unhandled exception), \
+                      (thermal warning -> pool exhaustion -> unhandled exception), \
                       recovered after an automatic restart."
                 .to_string(),
             key_events: vec![
@@ -572,8 +572,8 @@ impl LogScopeApp {
         let pal = self.pal();
         ui.horizontal(|ui| {
             for lvl in LEVEL_ORDER.iter() {
-                let color = pal.level_color(*lvl);
-                ui.label(RichText::new("■").size(10.0).color(color));
+                let (r, _) = ui.allocate_exact_size(Vec2::new(9.0, 9.0), Sense::hover());
+                ui.painter().rect_filled(r.shrink(1.5), 0.0, pal.level_color(*lvl));
                 ui.label(RichText::new(lvl.as_str()).size(9.5).color(pal.text_muted));
                 ui.add_space(2.0);
             }
@@ -820,6 +820,48 @@ impl LogScopeApp {
     // Panels
     // ------------------------------------------------------------------
 
+    /// Draw a simple vector icon centered in a rail button, so the rail
+    /// never depends on font glyph coverage (tofu on Windows otherwise).
+    fn rail_icon(p: &egui::Painter, rect: Rect, kind: u8, color: egui::Color32) {
+        let c = rect.center();
+        let s = Stroke::new(1.6, color);
+        match kind {
+            0 => {
+                // plus (add files)
+                p.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(6.0, 0.0)], s);
+                p.line_segment([c + Vec2::new(0.0, -6.0), c + Vec2::new(0.0, 6.0)], s);
+            }
+            1 => {
+                // folder (add folder)
+                let body = Rect::from_center_size(c + Vec2::new(0.0, 1.5), Vec2::new(16.0, 9.0));
+                p.rect_stroke(body, 1.0, s, egui::epaint::StrokeKind::Middle);
+                let a = body.left_top();
+                p.line_segment([a, a + Vec2::new(4.0, -3.0)], s);
+                p.line_segment([a + Vec2::new(4.0, -3.0), a + Vec2::new(10.0, -3.0)], s);
+            }
+            2 => {
+                // x (clear)
+                p.line_segment([c + Vec2::new(-5.0, -5.0), c + Vec2::new(5.0, 5.0)], s);
+                p.line_segment([c + Vec2::new(-5.0, 5.0), c + Vec2::new(5.0, -5.0)], s);
+            }
+            _ => {
+                // half-filled circle (theme cycle)
+                let pts: Vec<Pos2> = (0..=8)
+                    .map(|i| {
+                        let a = std::f32::consts::PI * (-0.5 + i as f32 / 8.0);
+                        c + Vec2::new(a.cos() * 6.0, a.sin() * 6.0)
+                    })
+                    .collect();
+                p.add(egui::epaint::Shape::convex_polygon(
+                    pts,
+                    color,
+                    Stroke::NONE,
+                ));
+                p.circle_stroke(c, 6.0, s);
+            }
+        }
+    }
+
     fn rail(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
         let mut cycle_theme = false;
@@ -837,32 +879,33 @@ impl LogScopeApp {
             )
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    if ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new("＋").size(15.0)))
-                        .on_hover_text("Add log files, .evtx, or .zip/.tar archives (multi-select in dialog).")
+                    let r = ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new(" ").size(14.0)));
+                    Self::rail_icon(ui.painter(), r.rect, 0, pal.text);
+                    if r.on_hover_text("Add log files, .evtx, or .zip/.tar archives (multi-select in dialog).")
                         .clicked()
                     {
                         add_f = true;
                     }
-                    if ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new("▤").size(14.0)))
-                        .on_hover_text("Add a folder — every log file inside is parsed recursively.")
+                    let r = ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new(" ").size(14.0)));
+                    Self::rail_icon(ui.painter(), r.rect, 1, pal.text);
+                    if r.on_hover_text("Add a folder — every log file inside is parsed recursively.")
                         .clicked()
                     {
                         add_d = true;
                     }
-                    if ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new("✕").size(13.0)))
-                        .on_hover_text("Remove all inputs from the workspace.")
+                    let r = ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new(" ").size(14.0)));
+                    Self::rail_icon(ui.painter(), r.rect, 2, pal.text);
+                    if r.on_hover_text("Remove all inputs from the workspace.")
                         .clicked()
                     {
                         clear = true;
                     }
                     ui.add_space(10.0);
                     ui.separator();
-                    if ui.add_sized(
-                        [30.0, 28.0],
-                        egui::Button::new(RichText::new("◐").size(15.0).color(pal.kicker)),
-                    )
-                    .on_hover_text(format!("Theme: {} — click to cycle.", self.theme.label()))
-                    .clicked()
+                    let r = ui.add_sized([30.0, 28.0], egui::Button::new(RichText::new(" ").size(14.0)));
+                    Self::rail_icon(ui.painter(), r.rect, 3, pal.kicker);
+                    if r.on_hover_text(format!("Theme: {} — click to cycle.", self.theme.label()))
+                        .clicked()
                     {
                         cycle_theme = true;
                     }
@@ -910,7 +953,7 @@ impl LogScopeApp {
                         if self.workspace.is_empty() {
                             ui.add_space(8.0);
                             ui.label(
-                                RichText::new("Empty — use ＋ in the rail to add files, archives, or a folder.")
+                                RichText::new("Empty — use + in the rail to add files, archives, or a folder.")
                                     .size(11.5)
                                     .color(pal.text_muted),
                             );
@@ -998,7 +1041,7 @@ impl LogScopeApp {
                             .desired_width(150.0),
                     )
                     .on_hover_text("Start of the time window (inclusive). Blank = include all earlier logs.");
-                    ui.label(RichText::new("→").color(pal.text_muted));
+                    ui.label(RichText::new("->").color(pal.text_muted));
                     ui.label(RichText::new("End").size(11.0).color(pal.text_muted));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.end)
@@ -1055,7 +1098,7 @@ impl LogScopeApp {
                             .unwrap_or(0);
                         let active =
                             self.selected_levels.is_empty() || self.selected_levels.contains(lvl);
-                        let label = format!("● {} {}", lvl.as_str(), count);
+                        let label = format!("• {} {}", lvl.as_str(), count);
                         let color = pal.level_color(*lvl);
                         let text = if active {
                             RichText::new(label).size(11.0).color(color)
@@ -1105,7 +1148,7 @@ impl LogScopeApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let dot = if self.error.is_some() { pal.error } else { pal.accent };
-                    ui.label(RichText::new("●").size(9.0).color(dot));
+                    ui.label(RichText::new("•").size(9.0).color(dot));
                     ui.label(
                         RichText::new(if self.running { "Working…" } else { "Ready" })
                             .size(10.5)
@@ -1251,7 +1294,7 @@ impl LogScopeApp {
                 .on_hover_text("Sent as a Bearer token. Stored in the OS keyring (Windows Credential Manager / macOS Keychain / Linux Secret Service) — never in the settings file. Leave empty for local servers.");
                 if !self.keyring_available && !self.llm_cfg.api_key.is_empty() {
                     ui.label(
-                        RichText::new("⚠ OS keyring unavailable — this key stays in memory only and will not be saved.")
+                        RichText::new("! OS keyring unavailable — this key stays in memory only and will not be saved.")
                             .size(10.0)
                             .color(pal.error),
                     );
@@ -1260,7 +1303,7 @@ impl LogScopeApp {
                     .on_hover_text("Apply the sanitize pipeline above to the payload. Keep it on for cloud providers; uncheck only for trusted local endpoints.");
                 if self.redact_before_send && !self.sanitize.is_active() {
                     ui.label(
-                        RichText::new("⚠ Sanitize is off — logs will be sent unredacted.")
+                        RichText::new("! Sanitize is off — logs will be sent unredacted.")
                             .size(10.0)
                             .color(pal.error),
                     );
