@@ -1,6 +1,6 @@
 [package]
 name = "logscope"
-version = "0.4.5"
+version = "0.5.0"
 edition = "2021"
 description = "Rust port of the LogScope log-parsing core (Phase 1: models + parser)"
 
@@ -8,15 +8,19 @@ description = "Rust port of the LogScope log-parsing core (Phase 1: models + par
 bzip2 = "0.6.1"
 chrono = "0.4"
 clap = { version = "4.6.7", features = ["derive"] }
-eframe = "0.36.2"
+eframe = { version = "0.36.2", features = ["persistence"] }
 egui = "0.36.2"
 evtx = "0.12"
 flate2 = "1.1.10"
 image = "0.25.10"
+keyring = "4"
 regex = "1"
 rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tar = "0.4.46"
 thiserror = "2.0.20"
+ureq = { version = "3", features = ["json"] }
 zip = "8.6.0"
 
 [[bin]]
